@@ -309,13 +309,17 @@ def chat():
                         content_type=upstream.headers.get("Content-Type", "application/json"))
 
     if want_stream:
+        # 生成器是惰性的，迭代时请求上下文已结束，不能再碰 flask.g
+        # （Working outside of application context → done 日志丢失/500）。
+        rid, t0 = g.rid, g.t0
+
         def gen():
             try:
                 for chunk in upstream.iter_content(chunk_size=4096):
                     if chunk:
                         yield chunk
             finally:
-                logger.info("[%s] done: stream %.1fs", g.rid, time.time() - g.t0)
+                logger.info("[%s] done: stream %.1fs", rid, time.time() - t0)
         return Response(gen(), status=200, content_type="text/event-stream")
 
     # 非流式：本地聚合 SSE
@@ -403,13 +407,15 @@ def responses_route():
                         content_type=upstream.headers.get("Content-Type", "application/json"))
 
     if want_stream:
+        rid, t0 = g.rid, g.t0
+
         def gen():
             try:
                 for chunk in upstream.iter_content(chunk_size=4096):
                     if chunk:
                         yield chunk
             finally:
-                logger.info("[%s] done: responses %.1fs", g.rid, time.time() - g.t0)
+                logger.info("[%s] done: responses %.1fs", rid, time.time() - t0)
         return Response(gen(), status=200,
                         content_type=upstream.headers.get("Content-Type", "text/event-stream"))
 
