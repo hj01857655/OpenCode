@@ -1,0 +1,23 @@
+# 凭证与环境（绝不入库）
+credentials.json
+credentials.json.tmp
+.env
+*.token
+auths/
+
+# 日志与抓包
+request.log*
+server.log*
+server_console.log*
+dumps/
+
+# Python 产物
+__pycache__/
+*.pyc
+
+# 内嵌开源克隆（opencode-ai/opencode）
+repo-v2/
+
+# 通用
+node_modules/
+.breezell/

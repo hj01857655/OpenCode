@@ -1,0 +1,20 @@
+# 凭证与环境（绝不入库）
+credentials.json
+credentials.json.tmp
+.env
+*.token
+auths/
+
+# 日志与抓包
+request.log*
+server.log*
+server_console.log*
+dumps/
+cap/
+cap.log
+
+# Python 产物
+__pycache__/
+*.pyc
+
+# 开源克隆忽略规则在上级 OpenCode/.gitignore（repo/ 已上移）
