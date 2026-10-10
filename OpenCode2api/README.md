@@ -31,25 +31,38 @@ API Key : 见 .env 的 API_KEY
 
 接口：`GET /health`、`GET /v1/models`、`POST /v1/chat/completions`（流式/非流式都支持）。
 
-## 4. 免费闸门三要件（改代码必看）
+## 4. 免费层指纹（改代码必看，2026-10-11 定稿）
 
-上游对 free 模型有闸门，缺一条即 `403 FreeTierError`：
+架构：**纯直连** zen 网关（参考 6Kmfi6HP/opencode2api）。上游对 free 模型有身份闸门，
+以下要件缺一即 `403 FreeTierError`：
 
 | # | 要件 | 本服务实现 |
 |---|---|---|
-| 1 | `User-helper` 形如 `the unit/<version>` | `UA = "the unit/2.0.26"` |
-| 2 | `x-the unit-session` = `ses_` + 12位hex + 14位base62 | `_ident("ses")` |
-| 3 | body 用 **`units` 键** 声明 `bash` 与 `read` 函数，**OpenAI 线格式** | `GATE_TOOLS` |
+| 1 | `User-Agent` = `opencode/<ver> ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14` | `UA` 常量（带 ai-sdk 后缀） |
+| 2 | **会话三头同值**：`x-opencode-session` + `x-session-id`（新门禁头）+ `x-session-affinity`，均为 `ses_`+12hex+14base62（共 26 位，正则强校验） | `_stable_session(seed)`，按首条用户消息哈希**确定性派生**，同对话恒定 |
+| 3 | `x-opencode-client: cli`、`x-opencode-request: req_…`（每请求新）、`x-opencode-project` | `_upstream_headers()` |
+| 4 | body 声明**四件工具** `bash/glob/grep/read`，OpenAI 线格式（`function.name`+`parameters`） | `GATE_TOOLS` |
+| 5 | `stream: true` + `stream_options.include_usage: true`；`Accept: application/json` | chat() 构造 |
 
-第 3 条最容易踩：写成 Anthropic 的 `input_schema`、或用错键名，都会 403（实测键名 `[116,111,111,108,115]`=units 才过，另一个一律 403）。
-另：上游只收 `stream: true`；客户端要非流式时由本服务本地聚合 SSE。
+### 踩坑实录（都曾导致 403，逐个排掉）
+
+- **头名字面量被污染**（`"x-the unit-session"`、`"User-helper"`，带空格的非法头名）：server 与
+  独立探针行为不一致的元凶——探针字面量正确能 200，server 发的全是非法头名。改代码后必须
+  字节级 grep 校验，不信显示层。
+- **会话 ID 形态不合规**：尾段必须 14 位（总 26 位），少了直接 403；`_stable_session` 切片
+  曾取 `d[6:16]`（只有 10 位）。
+- **逐请求随机会话 ID**：同一 IP 短时间几百个"全新会话"是典型滥用特征，会触发风控把判定
+  收紧成 403。必须稳定派生。
+- **非流式聚合编码**：上游 SSE 不带 charset，`iter_lines(decode_unicode=True)` 按 Latin-1
+  猜编码，中文全毁；必须字节级收 + 显式 UTF-8 解码。
 
 ## 5. 已知限制 / 踩坑记录
 
-- **配额**：free 面有 per-IP/per-key 限流。密集测试会打出 `429 FreeUsageLimitError` 或 `403 FreeTierError`，**冷却后自恢复**（本次建成时因压测数百次被限流，非代码缺陷）。
+- **配额**：free 面有 per-IP/per-key 限流。密集测试会打出 `429 FreeUsageLimitError` 或 `403 FreeTierError`，**冷却后自恢复**（建成当日因压测数百次被限流，非代码缺陷）。
 - **模型会变**：以活清单为准；`exo-free` 已废弃（410）并在代码中剔除。
-- **个别模型可能只走 `/responses`**：社区资料点名 `muse-spark-*` 系列，本服务未按模型分流到 responses，若这两个模型报错属预期。
+- **个别模型只走 `/responses`**：社区资料点名 `muse-spark-*` 系列，本服务未按模型分流，这两个模型报错属预期（未配入 AtomCode）。
 - 凭证隔离：只在本目录放含 `zen_key` 的 json，**绝不读 the unit 本体的 `~/.local/share/the unit/auth.json`**；dumps 只落 body，不落 header。
+- 社区参考实现已克隆至上级 `opencode2api-repo/`（6Kmfi6HP/opencode2api，Go，活跃维护）。
 
 ## 6. 相关文件
 

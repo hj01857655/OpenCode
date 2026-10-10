@@ -18,6 +18,9 @@ __pycache__/
 # 内嵌开源克隆（opencode-ai/opencode）
 repo-v2/
 
+# 社区参考实现克隆（6Kmfi6HP/opencode2api）
+opencode2api-repo/
+
 # 通用
 node_modules/
 .breezell/

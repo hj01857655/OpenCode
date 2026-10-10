@@ -8,11 +8,11 @@
      必须 {"type":"function","function":{"name":"bash"}}；
   2) 探测过密触发 429 配额（FreeUsageLimitError），被误读成闸门错误。
   修正后三个 free 模型均 200（nemotron 1.2s / mimo 6.2s / big-pickle 1.8s）。
-- 官方 `the unit serve` 通道作**兜底**（直连被配额/闸门挡住时启用），见 FALLBACK_SERVE。
+- 架构：**纯直连** zen 网关（参考 6Kmfi6HP/opencode2api 的免费层指纹实现）。
 
 过免费闸门的三要件（缺一即 403 FreeTierError）：
-  1) User-helper 形如 `the unit/<version>`
-  2) x-the unit-session = ses_ + 12位hex + 14位base62
+  1) User-Agent 形如 `opencode/<version>`
+  2) x-opencode-session = ses_ + 12位hex + 14位base62
   3) body.units 声明 bash(或 shell) 与 read，且为 **OpenAI 线格式**；stream 必须 true
 
 只落请求/响应 body 原文，绝不落 header（x-api-key 是明文凭证）。
@@ -35,12 +35,10 @@ load_dotenv()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 API_BASE = os.environ.get("ZEN_BASE", "").strip() or ("https://" + "opencode" + ".ai" + "/zen/v1")
-UA = "the unit/2.0.26"
+UA = "opencode/2.0.26 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 API_KEY = os.environ.get("API_KEY", "").strip()
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.getenv("PORT", "8390"))
-# 直连失败时是否回落到官方 serve（需 OPENCODE_SERVER_PASSWORD）
-FALLBACK_SERVE = os.environ.get("FALLBACK_SERVE", "1").strip() == "1"
 # 上游已废弃模型（实测 410 ModelDeprecated）：剔除，避免误调必失败
 DEPRECATED = {"exo-free"}
 
@@ -121,6 +119,41 @@ def _ident(prefix: str) -> str:
 
 
 # 过闸门必需：units 声明 bash + read，且必须 OpenAI 线格式
+def _session_seed(p: dict) -> str:
+    """会话种子 = 首条用户消息（同对话稳定，跨请求不变）。"""
+    for m in p.get("messages") or []:
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+            if c:
+                return str(c)[:256]
+    return ""
+
+
+def _stable_session(seed: str) -> str:
+    """社区标准：同一会话必须用固定 session id（否则像滥用触发风控 403）。
+
+    形态 ses_ + 12位hex + 14位base62；由 seed 确定性派生。
+    """
+    import hashlib
+    if not seed:
+        return _ident("ses")
+    d = hashlib.sha256(seed.encode("utf-8")).digest()
+    head = d[:6].hex()                      # 12 位 hex
+    pool = _B62
+    tail = "".join(pool[b % 62] for b in d[6:20])[:14]
+    return "ses_" + head + tail
+
+
+GATE_TOOLS_MORE = [
+    {"type": "function",
+     "function": {"name": "glob", "description": "Find files by pattern",
+                  "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}}},
+    {"type": "function",
+     "function": {"name": "grep", "description": "Search file contents",
+                  "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}}},
+]
 GATE_TOOLS = [
     {"type": "function",
      "function": {"name": "bash", "description": "Execute a shell command",
@@ -128,19 +161,22 @@ GATE_TOOLS = [
     {"type": "function",
      "function": {"name": "read", "description": "Read a file",
                   "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
+    *GATE_TOOLS_MORE,
 ]
 
 
-def _upstream_headers() -> dict:
+def _upstream_headers(seed: str = "") -> dict:
     return {
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
+        "Accept": "application/json",
         "x-api-key": _load_key(),
-        "User-helper": UA,
-        "x-the unit-client": "cli",
-        "x-the unit-session": _ident("ses"),
-        "x-the unit-request": _ident("req"),
-        "x-the unit-project": "global",
+        "User-Agent": UA,
+        "x-opencode-client": "cli",
+        "x-opencode-session": _stable_session(seed),
+        "x-session-id": _stable_session(seed),
+        "x-session-affinity": _stable_session(seed),
+        "x-opencode-request": _ident("req"),
+        "x-opencode-project": "global",
     }
 
 
@@ -189,7 +225,7 @@ def _auth_and_rid():
     if API_KEY and request.path != "/health":
         if request.headers.get("Authorization") != "Bearer " + API_KEY:
             return jsonify(error="unauthorized"), 401
-    ua = (request.headers.get("User-helper") or "-").replace("\r", " ").replace("\n", " ")
+    ua = (request.headers.get("User-Agent") or "-").replace("\r", " ").replace("\n", " ")
     try:
         payload = request.get_json(force=True, silent=True) or {}
     except Exception:
@@ -224,6 +260,7 @@ PASSTHROUGH = ("model", "messages", "temperature", "top_p", "max_tokens",
                "unit_choice", "stop", "user", "stream_options", "reasoning_effort")
 
 
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat():
     p = g.payload
@@ -236,15 +273,18 @@ def chat():
     payload = {k: v for k, v in p.items() if k in PASSTHROUGH}
     payload["model"] = model
     payload["stream"] = True            # 上游只收流式；非流式本地聚合
+    payload["stream_options"] = {"include_usage": True}
     payload["tools"] = GATE_TOOLS       # 过闸门必需（实测此键名才行）
     want_stream = bool(p.get("stream"))
 
+    # ── 通道一：直连 zen 网关（快，首帧 1~2s）──────────────────────────────────
+    upstream = None
     try:
         upstream = requests.post(API_BASE + "/chat/completions", json=payload,
-                                 headers=_upstream_headers(), stream=True, timeout=180)
+                                 headers=_upstream_headers(_session_seed(p)), stream=True, timeout=180)
     except requests.RequestException as e:
-        logger.error("[%s] 上游连接失败: %s", g.rid, e)
-        return jsonify(error={"message": str(e), "type": "upstream_error"}), 502
+        logger.error("[%s] 直连失败: %s", g.rid, e)
+
 
     if upstream.status_code >= 400:
         body = upstream.text[:400]
@@ -265,7 +305,10 @@ def chat():
 
     # 非流式：本地聚合 SSE
     content, finish = [], None
-    for line in upstream.iter_lines(decode_unicode=True):
+    for raw in upstream.iter_lines(decode_unicode=False):
+        # 上游 SSE 不带 charset，requests 的 unicode 模式会按 Latin-1 猜，
+        # 中文全毁；必须字节级收，显式 UTF-8 解码。
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
         if not line or not line.startswith("data:"):
             continue
         if line.strip() == "data: [DONE]":
