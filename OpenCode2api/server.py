@@ -120,7 +120,10 @@ def _ident(prefix: str) -> str:
 
 # 过闸门必需：units 声明 bash + read，且必须 OpenAI 线格式
 def _session_seed(p: dict) -> str:
-    """会话种子 = 首条用户消息（同对话稳定，跨请求不变）。"""
+    """会话种子 = 首条用户消息（同对话稳定，跨请求不变）。
+
+    chat 线读 messages；Responses 线读 input（字符串或分段列表）。
+    """
     for m in p.get("messages") or []:
         if m.get("role") == "user":
             c = m.get("content")
@@ -128,6 +131,18 @@ def _session_seed(p: dict) -> str:
                 c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
             if c:
                 return str(c)[:256]
+    inp = p.get("input")
+    if isinstance(inp, str) and inp:
+        return inp[:256]
+    if isinstance(inp, list):
+        for x in inp:
+            if isinstance(x, dict) and x.get("type") == "message":
+                c = x.get("content")
+                if isinstance(c, list):
+                    c = " ".join(i.get("text", "") for i in c
+                                 if isinstance(i, dict) and i.get("type") == "input_text")
+                if c:
+                    return str(c)[:256]
     return ""
 
 
@@ -332,6 +347,95 @@ def chat():
     body = json.dumps(out, ensure_ascii=False)
     logger.info("[%s] done: status=200 %dB %.1fs", g.rid, len(body), time.time() - g.t0)
     _dump_save(g.rid, "resp", body)
+    return Response(body, status=200, content_type="application/json")
+
+
+# ── /v1/responses 透传（muse-spark-* 等仅支持 Responses 协议的模型）──────────
+# 与 chat 同一套免费层指纹；差别：上游路径 /responses、工具为扁平格式
+# （无 "function" 包裹层）、会话种子兼容 input 字段。协议本身不转换，原样透传。
+GATE_TOOLS_FLAT = [
+    {"type": "function", "name": "bash", "description": "Execute a shell command",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}},
+    {"type": "function", "name": "glob", "description": "Find files by pattern",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}},
+    {"type": "function", "name": "grep", "description": "Search file contents",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}},
+    {"type": "function", "name": "read", "description": "Read a file",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+]
+
+
+@app.route("/v1/responses", methods=["POST"])
+def responses_route():
+    p = g.payload
+    model = p.get("model") or ""
+    if model and not _model_free(model):
+        return jsonify(error={"message": "model %s 不在免费清单" % model,
+                              "type": "invalid_request_error"}), 400
+
+    payload = dict(p)
+    payload["model"] = model
+    # 过闸门必需（与 chat 同款）：stream:true —— 实测 /responses 线 stream 缺省即 403
+    payload["stream"] = True
+    # 过闸门必需：客户端没带工具时注入四件套（已有则保留客户端的在前）
+    tools = payload.get("tools")
+    if not isinstance(tools, list) or not tools:
+        payload["tools"] = GATE_TOOLS_FLAT
+    else:
+        names = {t.get("name") for t in tools if isinstance(t, dict)}
+        payload["tools"] = list(tools) + [t for t in GATE_TOOLS_FLAT
+                                          if t["name"] not in names]
+    want_stream = bool(p.get("stream"))
+
+    try:
+        upstream = requests.post(API_BASE + "/responses", json=payload,
+                                 headers=_upstream_headers(_session_seed(p)),
+                                 stream=True, timeout=180)
+    except requests.RequestException as e:
+        logger.error("[%s] 上游连接失败: %s", g.rid, e)
+        return jsonify(error={"message": str(e), "type": "upstream_error"}), 502
+
+    if upstream.status_code >= 400:
+        logger.warning("[%s] 上游错误 HTTP %s: %s", g.rid,
+                       upstream.status_code, upstream.text[:400])
+        _dump_save(g.rid, "resp", upstream.text)
+        return Response(upstream.text, status=upstream.status_code,
+                        content_type=upstream.headers.get("Content-Type", "application/json"))
+
+    if want_stream:
+        def gen():
+            try:
+                for chunk in upstream.iter_content(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+            finally:
+                logger.info("[%s] done: responses %.1fs", g.rid, time.time() - g.t0)
+        return Response(gen(), status=200,
+                        content_type=upstream.headers.get("Content-Type", "text/event-stream"))
+
+    # 非流式：聚合 Responses SSE。终止帧可能是 completed（正常）或
+    # incomplete（max_output_tokens 被推理耗尽即截断，muse-spark 等推理模型
+    # 小额度必现）或 failed；三者都是合法的 Responses 终态，原样返回。
+    done = None
+    for raw in upstream.iter_lines(decode_unicode=False):
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        if not line.startswith("data:"):
+            continue
+        try:
+            evt = json.loads(line[5:].strip())
+        except Exception:
+            continue
+        t = evt.get("type")
+        if t in ("response.completed", "response.incomplete", "response.failed") \
+                and isinstance(evt.get("response"), dict):
+            done = evt["response"]
+            if t != "response.incomplete":
+                break
+    if done is None:
+        return jsonify(error={"message": "上游未返回终止帧（completed/incomplete/failed）",
+                              "type": "upstream_error"}), 502
+    body = json.dumps(done, ensure_ascii=False)
+    logger.info("[%s] done: responses-aggr %dB %.1fs", g.rid, len(body), time.time() - g.t0)
     return Response(body, status=200, content_type="application/json")
 
 

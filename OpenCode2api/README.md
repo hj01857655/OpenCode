@@ -60,7 +60,7 @@ API Key : 见 .env 的 API_KEY
 
 - **配额**：free 面有 per-IP/per-key 限流。密集测试会打出 `429 FreeUsageLimitError` 或 `403 FreeTierError`，**冷却后自恢复**（建成当日因压测数百次被限流，非代码缺陷）。
 - **模型会变**：以活清单为准；`exo-free` 已废弃（410）并在代码中剔除。
-- **个别模型只走 `/responses`**：社区资料点名 `muse-spark-*` 系列，本服务未按模型分流，这两个模型报错属预期（未配入 AtomCode）。
+- **`muse-spark-*` 走 `/responses`**：本服务已加 `/v1/responses` 透传路由（同指纹；上游强制 `stream:true`，非流式本地聚合 completed/incomplete/failed 终态帧），已配入 AtomCode（`provider="responses"` 账号）。注意 muse-spark 是推理模型，`max_output_tokens` 给太小会被推理耗尽触发 `incomplete` 截断。
 - 凭证隔离：只在本目录放含 `zen_key` 的 json，**绝不读 the unit 本体的 `~/.local/share/the unit/auth.json`**；dumps 只落 body，不落 header。
 - 社区参考实现已克隆至上级 `opencode2api-repo/`（6Kmfi6HP/opencode2api，Go，活跃维护）。
 
