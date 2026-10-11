@@ -246,10 +246,10 @@ def _auth_and_rid():
     except Exception:
         payload = {}
     g.payload = payload
-    logger.info("[%s] in: %s %s | model=%s msgs=%s units=%s stream=%s | ua=%s | body=%dB",
+    logger.info("[%s] in: %s %s | model=%s msgs=%s tools=%s stream=%s | ua=%s | body=%dB",
                 g.rid, request.method, request.path,
                 payload.get("model"), len(payload.get("messages") or []),
-                len(payload.get("units") or []), payload.get("stream"), ua,
+                len(payload.get("tools") or []), payload.get("stream"), ua,
                 request.content_length or 0)
     if request.path == "/v1/chat/completions":
         _dump_save(g.rid, "req", request.get_data(cache=True, as_text=True))
