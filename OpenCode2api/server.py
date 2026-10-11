@@ -298,8 +298,11 @@ def chat():
         upstream = requests.post(API_BASE + "/chat/completions", json=payload,
                                  headers=_upstream_headers(_session_seed(p)), stream=True, timeout=180)
     except requests.RequestException as e:
+        # 必须在这里返回：upstream 仍是 None，继续往下走 upstream.status_code
+        # 会抛 AttributeError，把网络故障伪装成 500。
         logger.error("[%s] 直连失败: %s", g.rid, e)
-
+        return jsonify(error={"message": "upstream error: %s" % e,
+                              "type": "upstream_error"}), 502
 
     if upstream.status_code >= 400:
         body = upstream.text[:400]
@@ -314,12 +317,20 @@ def chat():
         rid, t0 = g.rid, g.t0
 
         def gen():
+            n = 0
+            ttft = None
             try:
                 for chunk in upstream.iter_content(chunk_size=4096):
                     if chunk:
+                        if ttft is None:
+                            ttft = time.time() - t0
+                        n += len(chunk)
                         yield chunk
             finally:
-                logger.info("[%s] done: stream %.1fs", rid, time.time() - t0)
+                # 必须记字节数与首帧耗时：只记耗时时"200 但空流"和"正常返回"无法区分
+                logger.info("[%s] done: stream %dB %.1fs ttft=%s", rid, n,
+                            time.time() - t0,
+                            "%.1fs" % ttft if ttft else "-")
         return Response(gen(), status=200, content_type="text/event-stream")
 
     # 非流式：本地聚合 SSE
@@ -410,12 +421,19 @@ def responses_route():
         rid, t0 = g.rid, g.t0
 
         def gen():
+            n = 0
+            ttft = None
             try:
                 for chunk in upstream.iter_content(chunk_size=4096):
                     if chunk:
+                        if ttft is None:
+                            ttft = time.time() - t0
+                        n += len(chunk)
                         yield chunk
             finally:
-                logger.info("[%s] done: responses %.1fs", rid, time.time() - t0)
+                logger.info("[%s] done: responses %dB %.1fs ttft=%s", rid, n,
+                            time.time() - t0,
+                            "%.1fs" % ttft if ttft else "-")
         return Response(gen(), status=200,
                         content_type=upstream.headers.get("Content-Type", "text/event-stream"))
 
