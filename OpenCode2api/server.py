@@ -289,7 +289,17 @@ def chat():
     payload["model"] = model
     payload["stream"] = True            # 上游只收流式；非流式本地聚合
     payload["stream_options"] = {"include_usage": True}
-    payload["tools"] = GATE_TOOLS       # 过闸门必需（实测此键名才行）
+    # 过闸门必需 tools 声明，但不能整包替换客户端的工具：否则模型只剩 bash/read/glob/grep
+    # 四个假工具可调，真实工具（read_file/edit_file 等）全丢，表现就是"发一下就停了"。
+    # 做法与 responses 线一致：客户端工具在前，缺失的过闸门工具补在后面。
+    tools = p.get("tools")
+    if not isinstance(tools, list) or not tools:
+        payload["tools"] = GATE_TOOLS
+    else:
+        names = {(t.get("function") or {}).get("name")
+                 for t in tools if isinstance(t, dict)}
+        payload["tools"] = list(tools) + [
+            t for t in GATE_TOOLS if t["function"]["name"] not in names]
     want_stream = bool(p.get("stream"))
 
     # ── 通道一：直连 zen 网关（快，首帧 1~2s）──────────────────────────────────
