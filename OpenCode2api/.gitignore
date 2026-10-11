@@ -10,8 +10,6 @@ request.log*
 server.log*
 server_console.log*
 dumps/
-cap/
-cap.log
 
 # Python 产物
 __pycache__/
