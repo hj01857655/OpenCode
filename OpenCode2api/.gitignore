@@ -11,6 +11,9 @@ server.log*
 server_console.log*
 dumps/
 
+# 本地运行态（免费清单落盘，随上游变，不必进版本库）
+free_cache.json
+
 # Python 产物
 __pycache__/
 *.pyc

@@ -195,42 +195,197 @@ def _upstream_headers(seed: str = "") -> dict:
     }
 
 
+# ── 上游转发：共享连接池 + 连接级单次重试 ────────────────────────────────────
+# 2026-10-13 实测：chat 线 210 次失败全是 `SSLEOFError(UNEXPECTED_EOF_WHILE_READING)`，
+# 而**同期 24 次纯 TLS 握手、以及串行/并发 GET+POST 全部 0 失败**。结论：
+#   1) 不是证书/协议/体积问题（失败请求 body 中位 277KB，成功 334KB，同分布）；
+#   2) 是上游在坏窗口里"接受 TCP+TLS、读完请求后不发响应直接 FIN"的偶发断连。
+# 两个动作各自解决一部分：
+#   A. 共享 Session（keep-alive 连接池）：原先每次 `requests.post` 新建 Session，
+#      每请求都要重走 TCP+TLS 握手，坏窗口里握手次数≈失败次数。池化后复用已建立
+#      的长连接，直接把暴露在坏窗口里的握手数量降下来。
+#   B. 连接级失败重试 1 次：只对"拿不到响应头"的异常重试。SSE 字节一旦开始下发
+#      就绝不重试（客户端已收到半截流，重发会重复输出且重复计费）。
+#      另外日志里同 msgs 数的请求会在同秒重复出现，说明 opencode 客户端本就会对
+#      我们的 502 重发 —— 服务端补这一次，总请求数反而比放任客户端重试更少。
+_UPSTREAM_POOL = int(os.getenv("UPSTREAM_POOL", "32"))
+_UPSTREAM_RETRY = int(os.getenv("UPSTREAM_RETRY", "1"))
+
+
+def _new_upstream_session() -> requests.Session:
+    s = requests.Session()
+    # max_retries=0：重试由 _post_upstream 显式控制，避免 urllib3 静默重试放大请求量。
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=_UPSTREAM_POOL, pool_maxsize=_UPSTREAM_POOL,
+        max_retries=0)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+_upstream_session = _new_upstream_session()
+
+
+def _is_retryable_upstream_error(e: Exception) -> bool:
+    """只在"尚未拿到任何响应"时重试；其余一律放过。
+
+    分类依据：`ConnectTimeout` 本身是 `ConnectionError` 的子类，所以下面这一条
+    已经覆盖了它；`ReadTimeout` 只属于 `Timeout`（不是 `ConnectionError`），
+    落在最后返回 False —— 读超时说明请求很可能已被上游受理并可能已计费，
+    重发就是二次扣额度，宁可不试。
+    """
+    return isinstance(e, requests.exceptions.ConnectionError)
+
+
+def _post_upstream(path: str, payload: dict, seed: str, rid: str,
+                   timeout: int = 180):
+    """POST 上游并返回 Response（stream=True，未消费 body）。
+
+    全部尝试都失败时抛出最后一个异常，由调用方转 502。
+    """
+    last = None
+    for attempt in range(_UPSTREAM_RETRY + 1):
+        try:
+            return _upstream_session.post(
+                API_BASE + path, json=payload,
+                headers=_upstream_headers(seed), stream=True, timeout=timeout)
+        except requests.RequestException as e:
+            last = e
+            if attempt >= _UPSTREAM_RETRY or not _is_retryable_upstream_error(e):
+                raise
+            # 抖动一下再试：坏窗口通常成串，立刻重发很可能撞同一个坑。
+            # 断开的那条连接已从池里剔除，重试自然用新连接。
+            back = 0.4 * (attempt + 1) + random.uniform(0, 0.3)
+            logger.warning("[%s] 上游连接被切断，%.1fs 后重试 %d/%d: %s: %s",
+                           rid, back, attempt + 1, _UPSTREAM_RETRY,
+                           type(e).__name__, str(e)[:120])
+            time.sleep(back)
+    raise last  # pragma: no cover —— 循环内必定 return 或 raise
+
+
 app = Flask(__name__)
 
-# ── free 模型清单（活清单，10 分钟刷新）──────────────────────────────────────────
-_free = {"ids": [], "at": 0.0}
+# ── free 模型清单（活清单，10 分钟刷新；落盘上次可用清单，冷启动不从空开始）──────
+#
+# 为什么这么麻烦：2026-10-13 00:25 那波 `拒绝非免费` 的根因不是「模型变了」，而是
+# **清单拉不到 = 清单空 = 闸门把所有请求都判成非免费**。实测这条 GET 的失败是
+# **成串来的**（同一时刻 curl 也挂：`schannel: failed to receive handshake`），
+# 一次失败要 5~6s 才返回，所以"多试几次"在坏窗口里会把用户请求拖死十几秒。
+#
+# 三条一起才成立：
+#   1) 失败不清空旧清单（一次抖动不该丢掉已知可用的名单）
+#   2) 清单落盘（重启不从空开始）
+#   3) 请求路径上的补拉**只发一次、超时很短**，失败立刻走命名兜底 —— 重试交给后台线程
+_free = {"ids": [], "at": 0.0, "fail_until": 0.0}
 _free_lock = threading.Lock()
+_FREE_CACHE = os.path.join(BASE, "free_cache.json")
+_FREE_TTL = 600          # 活清单有效期
+_INLINE_TIMEOUT = 4      # 请求路径上补拉的超时：宁可快速失败，不可拖死用户
+_FAIL_BACKOFF = 30       # 连续失败后这么久之内不再在请求路径上重试
 
 
-def _fetch_free(force: bool = False):
-    """从 zen 活清单拉 free 模型（清单会变，这是唯一可信来源）。"""
-    if not force and _free["ids"] and time.time() - _free["at"] < 600:
-        return
+def _free_ids_from_names(ids):
+    """zen 全清单里筛免费面。命名规则即免费面契约：付费 id（claude-*、gpt-* 等）不会匹配。"""
+    return [i for i in ids
+            if (i.endswith("-free") or i == "big-pickle") and i not in DEPRECATED]
+
+
+def _load_free_cache():
     try:
-        r = requests.get(API_BASE + "/models", headers=_upstream_headers(), timeout=20)
-        if r.status_code != 200:
-            logger.warning("[models] 清单拉取 HTTP %s", r.status_code)
-            return
-        ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
-        free_ids = [i for i in ids
-                    if (i.endswith("-free") or i == "big-pickle") and i not in DEPRECATED]
-        with _free_lock:
-            _free["ids"], _free["at"] = free_ids, time.time()
-        logger.info("[models] free 模型 %d 个: %s", len(free_ids), ", ".join(free_ids[:12]))
+        with open(_FREE_CACHE, encoding="utf-8") as f:
+            data = json.load(f)
+        ids = _free_ids_from_names(data.get("ids") or [])
+    except Exception:
+        return  # 没有缓存或缓存坏了：正常，首次启动就是这样
+    if not ids:
+        return
+    with _free_lock:
+        _free["ids"], _free["at"] = ids, 0.0
+    # at=0 让它看起来过期：后台线程 60s 内就会重拉换新。请求路径上不会重拉
+    # —— `_model_free` 只在清单为空时才补拉，这里清单非空，直接用缓存不卡用户。
+    logger.info("[models] 用上次落盘清单 %d 个兜底（后台 60s 内换新）", len(ids))
+
+
+def _save_free_cache(ids):
+    try:
+        tmp = _FREE_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ids": ids, "at": int(time.time())}, f)
+        os.replace(tmp, _FREE_CACHE)
     except Exception as e:
-        logger.warning("[models] 拉取失败: %s", e)
+        logger.warning("[models] 清单落盘失败（不影响转发）: %s", e)
+
+
+def _fetch_free(force: bool = False, quick: bool = False):
+    """从 zen 活清单拉 free 模型（清单会变，活清单优先）。
+
+    `quick=True` 给请求路径用：只试一次、超时 4s、失败进退避窗口。坏窗口里一次
+    失败要 5~6s 才返回，重试三轮会在用户请求上挂十几秒 —— 那比"暂时按命名兜底"糟得多。
+    真正的重试由后台线程做（它挂多久都不影响转发）。
+
+    失败时**保留旧清单不清空**：2026-10-13 00:25 那波 `拒绝非免费` 就是清单空了，
+    把 `mimo-v2.6-flash-free`、`space-bunny-free` 这些合法免费模型一并拒掉。
+
+    新鲜度按**是否联系上上游**记（`at`），不按「清单非空」记：上游真把免费面清空时
+    （全部转付费、或命名规则改了导致筛子筛空），空清单也是可信答案，得按 TTL 认
+    10 分钟 —— 否则每条请求都会重打一次上游，还会把日志刷成一片 `free 模型 0 个`。
+    """
+    if not force and time.time() - _free["at"] < _FREE_TTL:
+        return
+    if quick and time.time() < _free["fail_until"]:
+        return          # 刚失败过：这个窗口别再让每个请求都去撞一次
+    attempts = 1 if quick else 3
+    timeout = _INLINE_TIMEOUT if quick else 20
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            r = _upstream_session.get(API_BASE + "/models",
+                                      headers=_upstream_headers(), timeout=timeout)
+            if r.status_code != 200:
+                logger.warning("[models] 清单拉取 HTTP %s", r.status_code)
+                return
+            ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+            free_ids = _free_ids_from_names(ids)
+            with _free_lock:
+                _free["ids"], _free["at"] = free_ids, time.time()
+                _free["fail_until"] = 0.0
+            if free_ids:
+                _save_free_cache(free_ids)
+            logger.info("[models] free 模型 %d 个: %s", len(free_ids), ", ".join(free_ids[:12]))
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < attempts - 1:
+                time.sleep(0.5 * (attempt + 1))
+    with _free_lock:
+        _free["fail_until"] = time.time() + _FAIL_BACKOFF
+    # 带异常类型：这个 except 把网络错误和代码错误（清单结构变了、r.json() 抛的
+    # 解析错）吞在同一句「拉取失败」里，只打消息下次排查会认错方向。
+    logger.warning("[models] 拉取失败（试 %d 次）: %s: %s；保留旧清单 %d 个",
+                   attempts, type(last_err).__name__, last_err, len(_free["ids"]))
 
 
 def _refresh_loop():
+    """后台刷新：每 60s 醒一次，清单还新鲜就立刻返回。
+
+    为什么不是睡 600：原来只在成功的那一轮之后才计时，一次失败要等满 10 分钟才再试，
+    坏窗口能连撞 2~3 轮 —— 用户这段时间全在吃 400。改成短周期轮询，失败后 60s 就有
+    下一次机会；成功时 `_FREE_TTL` 仍保证 10 分钟才真打一次上游。
+    """
     while True:
-        time.sleep(600)
-        _fetch_free(force=True)
+        time.sleep(60)
+        _fetch_free()
 
 
 def _model_free(mid: str) -> bool:
     if not _free["ids"]:
-        _fetch_free()
-    return mid in _free["ids"]
+        _fetch_free(quick=True)
+    if _free["ids"]:
+        return mid in _free["ids"]
+    # 拉不到、也没有可用缓存（首次启动正撞上坏窗口）：按免费面命名规则兜底。
+    # 付费 id（claude-* / gpt-* / gemini-* …）匹配不上这条规则，所以这不放宽
+    # 「防误打订阅面扣费」的原意，只是不再把合法 free 模型当成非免费全拒。
+    return mid.endswith("-free") or mid == "big-pickle"
 
 
 @app.before_request
@@ -264,7 +419,8 @@ def health():
 @app.route("/v1/models")
 def models():
     if not _free["ids"]:
-        _fetch_free()
+        # quick：列模型是客户端一进来就打的请求，不能在这里挂十几秒等上游
+        _fetch_free(quick=True)
     now = int(time.time())
     return jsonify(object="list", data=[
         {"id": mid, "object": "model", "created": now, "owned_by": "the unit-zen-free"}
@@ -303,14 +459,14 @@ def chat():
     want_stream = bool(p.get("stream"))
 
     # ── 通道一：直连 zen 网关（快，首帧 1~2s）──────────────────────────────────
-    upstream = None
+    # 连接被切断时补试一次，理由与边界见 _post_upstream。
     try:
-        upstream = requests.post(API_BASE + "/chat/completions", json=payload,
-                                 headers=_upstream_headers(_session_seed(p)), stream=True, timeout=180)
+        upstream = _post_upstream("/chat/completions", payload,
+                                  _session_seed(p), g.rid)
     except requests.RequestException as e:
-        # 必须在这里返回：upstream 仍是 None，继续往下走 upstream.status_code
+        # 必须在这里返回：upstream 不存在，继续往下走 upstream.status_code
         # 会抛 AttributeError，把网络故障伪装成 500。
-        logger.error("[%s] 直连失败: %s", g.rid, e)
+        logger.error("[%s] 直连失败: %s: %s", g.rid, type(e).__name__, e)
         return jsonify(error={"message": "upstream error: %s" % e,
                               "type": "upstream_error"}), 502
 
@@ -413,11 +569,9 @@ def responses_route():
     want_stream = bool(p.get("stream"))
 
     try:
-        upstream = requests.post(API_BASE + "/responses", json=payload,
-                                 headers=_upstream_headers(_session_seed(p)),
-                                 stream=True, timeout=180)
+        upstream = _post_upstream("/responses", payload, _session_seed(p), g.rid)
     except requests.RequestException as e:
-        logger.error("[%s] 上游连接失败: %s", g.rid, e)
+        logger.error("[%s] 上游连接失败: %s: %s", g.rid, type(e).__name__, e)
         return jsonify(error={"message": str(e), "type": "upstream_error"}), 502
 
     if upstream.status_code >= 400:
@@ -474,6 +628,9 @@ def responses_route():
 
 
 if __name__ == "__main__":
-    _fetch_free()
+    _load_free_cache()        # 先用上次落盘的清单兜底，冷启动不再从空清单开始全拒
+    # quick：启动只试一次、4s 封顶。上游正在坏窗口时不该把启动拖到几十秒；
+    # 真正的补拉交给下面的后台线程（它挂多久都不影响转发）。
+    _fetch_free(quick=True)
     threading.Thread(target=_refresh_loop, daemon=True).start()
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)
