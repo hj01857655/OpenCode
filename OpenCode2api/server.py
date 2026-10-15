@@ -88,6 +88,19 @@ def _dump_trim():
             pass
 
 
+# dump 文件名前缀启动段：rid 每进程从 r0001 重新计数，旧版同名 rid 跳重启后直接覆盖旧证据
+_BOOT_TAG = time.strftime("%m%d-%H%M%S", time.localtime()) + "-p%d" % os.getpid()
+_seq_lock = threading.Lock()
+_req_seq = 0
+
+
+def _next_req_id():
+    global _req_seq
+    with _seq_lock:
+        _req_seq += 1
+        return "r%04d" % _req_seq
+
+
 def _dump_save(rid, kind, data):
     if not DUMP_ON or not data:
         return
@@ -95,7 +108,7 @@ def _dump_save(rid, kind, data):
         os.makedirs(DUMP_DIR, exist_ok=True)
         text = data if isinstance(data, str) else data.decode("utf-8", "replace")
         truncated = len(text) > DUMP_MAX_BYTES
-        path = os.path.join(DUMP_DIR, "%s.%s.txt%s" % (rid, kind, ".truncated" if truncated else ""))
+        path = os.path.join(DUMP_DIR, "%s.%s.%s.txt%s" % (_BOOT_TAG, rid, kind, ".truncated" if truncated else ""))
         with open(path, "w", encoding="utf-8") as f:
             f.write(text[:DUMP_MAX_BYTES])
         _dump_trim()
@@ -465,7 +478,7 @@ def _model_free(mid: str) -> bool:
 
 @app.before_request
 def _auth_and_rid():
-    g.rid = "r%04d" % int(time.time() * 10 % 10000)
+    g.rid = _next_req_id()
     g.t0 = time.time()
     if API_KEY and request.path != "/health":
         if request.headers.get("Authorization") != "Bearer " + API_KEY:
