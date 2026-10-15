@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """the unit2api：OpenAI 兼容反代 → the unit Zen 网关直连，只放行 free 模型。
 
-路线选择（2026-10-11 实测定案）：
-- **直连** POST https://opencode.ai/zen/v1/chat/completions —— 快（首帧 1~2s），
-  是主力路径。此前误以为"直连必 403"，实为两个自身错误：
-  1) units 用了 Anthropic 线格式（input_schema），而 zen 是 OpenAI 线，
-     必须 {"type":"function","function":{"name":"bash"}}；
-  2) 探测过密触发 429 配额（FreeUsageLimitError），被误读成闸门错误。
-  修正后三个 free 模型均 200（nemotron 1.2s / mimo 6.2s / big-pickle 1.8s）。
-- 架构：**纯直连** zen 网关（参考 6Kmfi6HP/opencode2api 的免费层指纹实现）。
+架构：**纯直连** 免费层网关（参考 6Kmfi6HP/opencode2api 的免费层指纹实现）。
 
-过免费闸门的三要件（缺一即 403 FreeTierError）：
-  1) User-Agent 形如 `opencode/<version>`
-  2) x-opencode-session = ses_ + 12位hex + 14位base62
-  3) body.units 声明 bash(或 shell) 与 read，且为 **OpenAI 线格式**；stream 必须 true
+2026-10-11 上游把免费层从 /zen/v1 迁到 /inference/v1（V2 门禁下沉到私有
+inference 服务，旧指纹一律 403 FreeTierError）。V2 指纹四要件
+（2026-10-13/14/15 消融，见 opencode2api 仓库 docs/labs/
+2026-10-13-free-tier-fingerprint-refresh.md 及 10-14/10-15 两个 fix 提交）：
+  1) session id 前 12 位 hex 必须是降序编码 ~(ts_ms*0x1000+counter) 低 48 位
+     （对齐上游 packages/schema/src/identifier.ts）；纯随机/升序即 403，
+     时效容忍 ≥7 天；同会话值需稳定（prompt 缓存亲和）
+  2) x-opencode-project 固定 "global"（40-hex project id 触发 403）
+  3) x-opencode-request 头不得出现（存在本身触发 403）
+  4) User-Agent 新三段式 opencode/latest/<ver>/cli（ver ≥ 2.0.0）
+  另：鉴权走 Authorization: Bearer <sk-key>（真实账号 key 有效，Bearer public 已关闭）；
+  body 仍需 OpenAI 线格式 tools 含 bash/glob/grep/read、stream:true（保真保留）。
 
-只落请求/响应 body 原文，绝不落 header（x-api-key 是明文凭证）。
+只落请求/响应 body 原文，绝不落 header（Authorization 是明文凭证）。
 """
 import json
 import logging
@@ -34,8 +35,9 @@ from flask import Flask, Response, g, jsonify, request
 load_dotenv()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-API_BASE = os.environ.get("ZEN_BASE", "").strip() or ("https://" + "opencode" + ".ai" + "/zen/v1")
-UA = "opencode/2.0.26 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+API_BASE = os.environ.get("ZEN_BASE", "").strip() or ("https://" + "opencode" + ".ai" + "/inference/v1")
+# V2 指纹 UA（2026-10-14 抓包 CLI v2.0.29）：opencode/<channel>/<version>/<name>
+OC_UA = "opencode/latest/2.0.29/cli"
 API_KEY = os.environ.get("API_KEY", "").strip()
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.getenv("PORT", "8390"))
@@ -92,18 +94,11 @@ def _dump_save(rid, kind, data):
         logger.warning("[%s] 落盘失败: %s", rid, e)
 
 
-def _load_key() -> str:
-    """按内容定位凭证（找含 zen_key 的 json），不硬编码文件名。"""
-    import glob
-    for path in glob.glob(os.path.join(BASE, "*.json")):
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data.get("zen_key"):
-                return data["zen_key"]
-        except Exception:
-            continue
-    raise RuntimeError("未找到含 zen_key 的凭证文件（放本目录即可）")
+# 免费层是匿名面：V2 门禁只校验指纹，不认 key。2026-10-15 实测（/inference/v1，同一份
+# 指纹与 body）：`Bearer public` 四次全 200，换成本地存的那把 sk- key 四次全 401
+# `Upstream request failed: Invalid credential`。所以不再读凭证文件——
+# `credentials.json` 留着备用，但不参与任何上游请求。要改用真 key 时设 UPSTREAM_AUTH。
+UPSTREAM_AUTH = os.environ.get("UPSTREAM_AUTH", "").strip() or "Bearer public"
 
 
 # ── 闸门指纹 ──────────────────────────────────────────────────────────────────
@@ -116,6 +111,72 @@ def _ident(prefix: str) -> str:
     return "%s_%s%s" % (prefix,
                         "".join(random.choice(_HEX) for _ in range(12)),
                         "".join(random.choice(_B62) for _ in range(14)))
+
+
+# ── V2 session 指纹 ────────────────────────────────────────────────────────────
+# 上游 2026-10-11 起校验 session id 的降序时间戳语义（2026-10-13 消融实测）：
+# 前 12 位 hex 必须是 ~(ts_ms*0x1000+counter) 的低 48 位（对齐上游
+# packages/schema/src/identifier.ts 的 descending TypeID），纯随机即 403，
+# 时效容忍 ≥7 天。同一会话值又必须稳定（prompt 缓存亲和），所以用
+# "种子→会话映射 + 落盘 + 3 天 TTL"，而不是逐请求生成。
+_SESSION_TTL_MS = 3 * 24 * 3600 * 1000
+_SESSION_MAX = 256
+_SESSION_FILE = os.path.join(BASE, "session_cache.json")
+_session_map = {}
+_id_lock = threading.Lock()
+_id_last_ms = 0
+_id_counter = 0
+
+
+def _new_oc_session() -> str:
+    """ses_ + 26 位降序 TypeID 主体（前 12 hex 反转时间戳 + 14 base62）。"""
+    global _id_last_ms, _id_counter
+    with _id_lock:
+        now_ms = int(time.time() * 1000)
+        if now_ms != _id_last_ms:
+            _id_last_ms, _id_counter = now_ms, 0
+        _id_counter += 1
+        counter = _id_counter
+    value = (~(now_ms * 0x1000 + counter)) & 0xFFFFFFFFFFFF
+    head = "".join(format((value >> (40 - 8 * i)) & 0xFF, "02x") for i in range(6))
+    tail = "".join(_B62[b % 62] for b in os.urandom(14))
+    return "ses_" + head + tail
+
+
+def _load_session_map():
+    try:
+        with open(_SESSION_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _session_map.update(
+                {k: v for k, v in data.items()
+                 if isinstance(v, dict) and isinstance(v.get("ses"), str) and v.get("ts")})
+    except Exception:
+        pass
+
+
+def _save_session_map():
+    try:
+        with open(_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(_session_map, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _oc_session_for(seed: str) -> str:
+    """会话种子 → 上游 session（稳定 + 降序编码 + 3 天 TTL 再生成）。
+
+    命名避开模块级 _upstream_session（那是 requests.Session 连接池）。"""
+    now_ms = int(time.time() * 1000)
+    entry = _session_map.get(seed)
+    if entry and now_ms - int(entry["ts"]) < _SESSION_TTL_MS:
+        return entry["ses"]
+    if len(_session_map) >= _SESSION_MAX:
+        oldest = min(_session_map, key=lambda k: int(_session_map[k]["ts"]))
+        _session_map.pop(oldest, None)
+    _session_map[seed] = {"ses": _new_oc_session(), "ts": now_ms}
+    _save_session_map()
+    return _session_map[seed]["ses"]
 
 
 # 过闸门必需：units 声明 bash + read，且必须 OpenAI 线格式
@@ -151,14 +212,8 @@ def _stable_session(seed: str) -> str:
 
     形态 ses_ + 12位hex + 14位base62；由 seed 确定性派生。
     """
-    import hashlib
-    if not seed:
-        return _ident("ses")
-    d = hashlib.sha256(seed.encode("utf-8")).digest()
-    head = d[:6].hex()                      # 12 位 hex
-    pool = _B62
-    tail = "".join(pool[b % 62] for b in d[6:20])[:14]
-    return "ses_" + head + tail
+    # V2 指纹：降序时间戳编码 + 种子稳定映射（见 _oc_session_for）
+    return _oc_session_for(seed)
 
 
 GATE_TOOLS_MORE = [
@@ -181,17 +236,22 @@ GATE_TOOLS = [
 
 
 def _upstream_headers(seed: str = "") -> dict:
+    """V2 指纹全量头（/inference/v1 路径，2026-10-15 对齐 opencode2api 实测）：
+    Authorization 固定 `Bearer public`（免费层匿名面，见 UPSTREAM_AUTH）；
+    四头同值 session；project 固定 global；x-opencode-request 不得出现
+    （存在本身触发 403）。"""
+    ses = _stable_session(seed)
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "x-api-key": _load_key(),
-        "User-Agent": UA,
+        "Authorization": UPSTREAM_AUTH,
+        "User-Agent": OC_UA,
         "x-opencode-client": "cli",
-        "x-opencode-session": _stable_session(seed),
-        "x-session-id": _stable_session(seed),
-        "x-session-affinity": _stable_session(seed),
-        "x-opencode-request": _ident("req"),
         "x-opencode-project": "global",
+        "x-opencode-session": ses,
+        "x-session-id": ses,
+        "x-session-affinity": ses,
+        "x-opencode-session-id": ses,
     }
 
 
@@ -339,8 +399,11 @@ def _fetch_free(force: bool = False, quick: bool = False):
     last_err = None
     for attempt in range(attempts):
         try:
+            # 模型清单与推理同为匿名面，共用 _upstream_headers 的 `Bearer public`
+            # （对齐 opencode2api fetchModels：该头同样要带全量指纹）。
+            headers = _upstream_headers()
             r = _upstream_session.get(API_BASE + "/models",
-                                      headers=_upstream_headers(), timeout=timeout)
+                                      headers=headers, timeout=timeout)
             if r.status_code != 200:
                 logger.warning("[models] 清单拉取 HTTP %s", r.status_code)
                 return
@@ -556,8 +619,13 @@ def responses_route():
 
     payload = dict(p)
     payload["model"] = model
-    # 过闸门必需（与 chat 同款）：stream:true —— 实测 /responses 线 stream 缺省即 403
+    # 过闸门必需（对齐 opencode2api applyFreeTierFingerprint）：stream:true、
+    # stream_options.include_usage=true —— 实测 /responses 线缺 stream_options 即 403
     payload["stream"] = True
+    if isinstance(payload.get("stream_options"), dict):
+        payload["stream_options"]["include_usage"] = True
+    else:
+        payload["stream_options"] = {"include_usage": True}
     # 过闸门必需：客户端没带工具时注入四件套（已有则保留客户端的在前）
     tools = payload.get("tools")
     if not isinstance(tools, list) or not tools:
@@ -628,6 +696,7 @@ def responses_route():
 
 
 if __name__ == "__main__":
+    _load_session_map()       # 落盘的会话映射兜底，重启不丢 prompt 缓存亲和
     _load_free_cache()        # 先用上次落盘的清单兜底，冷启动不再从空清单开始全拒
     # quick：启动只试一次、4s 封顶。上游正在坏窗口时不该把启动拖到几十秒；
     # 真正的补拉交给下面的后台线程（它挂多久都不影响转发）。
