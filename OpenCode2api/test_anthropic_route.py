@@ -245,10 +245,11 @@ def test_route():
     r = client.post("/v1/messages", json=dict(req, model="claude-x"))
     assert r.status_code == 400 and r.get_json()["type"] == "error"
 
-    # x-api-key 鉴权
+    # Bearer 鉴权（Claude Code 走 ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer）
     install_fake(CHAT_TEXT)
     server.API_KEY = "secret"
-    r = client.post("/v1/messages", json=req, headers={"x-api-key": "secret"})
+    r = client.post("/v1/messages", json=req,
+                    headers={"Authorization": "Bearer secret"})
     assert r.status_code == 200, (r.status_code, r.data[:300])
     r = client.post("/v1/messages", json=req)
     assert r.status_code == 401

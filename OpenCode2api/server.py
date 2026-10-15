@@ -458,9 +458,7 @@ def _auth_and_rid():
     g.rid = "r%04d" % int(time.time() * 10 % 10000)
     g.t0 = time.time()
     if API_KEY and request.path != "/health":
-        # Anthropic 客户端（Claude Code 等）发 x-api-key 而非 Authorization: Bearer
-        if (request.headers.get("Authorization") != "Bearer " + API_KEY
-                and request.headers.get("x-api-key") != API_KEY):
+        if request.headers.get("Authorization") != "Bearer " + API_KEY:
             return jsonify(error="unauthorized"), 401
     ua = (request.headers.get("User-Agent") or "-").replace("\r", " ").replace("\n", " ")
     try:
