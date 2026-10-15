@@ -77,15 +77,3 @@ Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向
 - **thinking / cache_control 丢失**：Anthropic 特有字段，Chat 协议无对应项
 - **绝不读 OpenCode 本体凭证**（`~/.local/share/OpenCode/auth.json`）；dumps 只落 body 不落 header
 
-## 项目结构
-
-```
-OpenCode2api/
-├── server.py              # Flask 反代主体
-├── responses_bridge.py    # Responses ⇄ Chat 翻译层
-├── anthropic_bridge.py    # Anthropic ⇄ Chat 翻译层
-├── test_anthropic_route.py
-├── .env                   # 本地配置
-├── request.log            # 运行日志
-└── dumps/                 # 请求/响应原文（仅 body）
-```
