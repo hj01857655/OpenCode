@@ -4,17 +4,23 @@
 架构：**纯直连** 免费层网关（参考 6Kmfi6HP/opencode2api 的免费层指纹实现）。
 
 2026-10-11 上游把免费层从 /zen/v1 迁到 /inference/v1（V2 门禁下沉到私有
-inference 服务，旧指纹一律 403 FreeTierError）。V2 指纹四要件
-（2026-10-13/14/15 消融，见 opencode2api 仓库 docs/labs/
-2026-10-13-free-tier-fingerprint-refresh.md 及 10-14/10-15 两个 fix 提交）：
-  1) session id 前 12 位 hex 必须是降序编码 ~(ts_ms*0x1000+counter) 低 48 位
-     （对齐上游 packages/schema/src/identifier.ts）；纯随机/升序即 403，
-     时效容忍 ≥7 天；同会话值需稳定（prompt 缓存亲和）
-  2) x-opencode-project 固定 "global"（40-hex project id 触发 403）
+inference 服务，旧指纹一律 403 FreeTierError）。门禁规格以本仓库
+docs/labs/2026-10-15-inference-v2-gate-ablation.md 消融定案为准
+（与 Go 版 10-13 报告有 5 处出入，以本次实测为准）：
+  1) session id 前 12 位 hex 必须是降序编码 ~(ts_ms<<12+k) 低 48 位
+     （对齐上游 packages/schema/src/identifier.ts）；纯随机/升序即 403；
+     counter k ∈ [1,63]（64 即拒）；时效容忍 ≥8 天；同会话值需稳定
+     （prompt 缓存亲和）
+  2) x-opencode-session-id（v2.0.29 新头）必发，且 session 族 4 头中
+     至少再带 1 个（同值或异值均可；单发 1 头 / 缺新头均 403）
   3) x-opencode-request 头不得出现（存在本身触发 403）
-  4) User-Agent 新三段式 opencode/latest/<ver>/cli（ver ≥ 2.0.0）
-  另：鉴权走 Authorization: Bearer <sk-key>（真实账号 key 有效，Bearer public 已关闭）；
-  body 仍需 OpenAI 线格式 tools 含 bash/glob/grep/read、stream:true（保真保留）。
+  4) tools 必须含 bash+read（chat 线最少集，顺序无关；缺 read 即 403），
+     parameters 为真实 schema（含非空 properties；description 随意）；
+     stream:true 必需；stream_options 非必需
+  UA 必须形如 opencode/<ver>：second 段为 latest 或 ≥2.0.0 的 semver
+  （1.0.0→426、非法段→403）；x-opencode-project / JSON 键序 / 连接方式
+  实测不参与校验；免费面鉴权 Authorization: Bearer public（真实 sk- key
+  打 GET /models 反 401）。
 
 只落请求/响应 body 原文，绝不落 header（Authorization 是明文凭证）。
 """
@@ -38,7 +44,8 @@ load_dotenv()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 API_BASE = os.environ.get("ZEN_BASE", "").strip() or ("https://" + "opencode" + ".ai" + "/inference/v1")
-# V2 指纹 UA（2026-10-14 抓包 CLI v2.0.29）：opencode/<channel>/<version>/<name>
+# UA 是门禁校验项（T/U 系列定案）：须 opencode/<ver≥2.0.0>（或 latest 通道）
+# ——低于下限 426、非法段 403。G 系列早期"不查 UA"系只测 opencode 系变体所致
 OC_UA = "opencode/latest/2.0.29/cli"
 API_KEY = os.environ.get("API_KEY", "").strip()
 LISTEN_HOST = "127.0.0.1"
@@ -116,10 +123,11 @@ def _ident(prefix: str) -> str:
 
 
 # ── V2 session 指纹 ────────────────────────────────────────────────────────────
-# 上游 2026-10-11 起校验 session id 的降序时间戳语义（2026-10-13 消融实测）：
-# 前 12 位 hex 必须是 ~(ts_ms*0x1000+counter) 的低 48 位（对齐上游
-# packages/schema/src/identifier.ts 的 descending TypeID），纯随机即 403，
-# 时效容忍 ≥7 天。同一会话值又必须稳定（prompt 缓存亲和），所以用
+# 上游 2026-10-11 起校验 session id 的降序时间戳语义（2026-10-15 消融定案）：
+# 前 12 位 hex 必须是 ~(ts_ms<<12 + counter) 的低 48 位（对齐上游
+# packages/schema/src/identifier.ts 的 descending TypeID），纯随机/升序即 403，
+# counter 有上界 63（64 即拒；下方 _new_oc_session 的每毫秒计数器实际远达不到），
+# 时效容忍 ≥8 天。同一会话值又必须稳定（prompt 缓存亲和），所以用
 # "种子→会话映射 + 落盘 + 3 天 TTL"，而不是逐请求生成。
 _SESSION_TTL_MS = 3 * 24 * 3600 * 1000
 _SESSION_MAX = 256
@@ -238,9 +246,11 @@ GATE_TOOLS = [
 
 
 def _upstream_headers(seed: str = "") -> dict:
-    """V2 指纹全量头（/inference/v1 路径，2026-10-15 对齐 opencode2api 实测）：
+    """V2 指纹全量头（/inference/v1 路径，2026-10-15 T/U 系列定案）：
     Authorization 固定 `Bearer public`（免费层匿名面，见 UPSTREAM_AUTH）；
-    四头同值 session；project 固定 global；x-opencode-request 不得出现
+    x-opencode-session-id 必发 + 四头全发同值（门禁：新头必需、族内 ≥2 头，
+    值可不同，全发最稳）；UA 是校验项（见 OC_UA 注）；project 不参与
+    校验（保留 global 仅为形似客户端）；x-opencode-request 禁发
     （存在本身触发 403）。"""
     ses = _stable_session(seed)
     return {
@@ -621,8 +631,8 @@ def responses_route():
 
     payload = dict(p)
     payload["model"] = model
-    # 过闸门必需（对齐 opencode2api applyFreeTierFingerprint）：stream:true、
-    # stream_options.include_usage=true —— 实测 /responses 线缺 stream_options 即 403
+    # 过闸门必需：stream:true（实测 stream:false 即 403）；stream_options
+    # 非必需（2026-10-15 F8/G10 定案），补 include_usage 仅对齐官方客户端形
     payload["stream"] = True
     if isinstance(payload.get("stream_options"), dict):
         payload["stream_options"]["include_usage"] = True
