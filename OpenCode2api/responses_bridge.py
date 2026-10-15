@@ -126,6 +126,10 @@ def _input_to_messages(body):
         if not isinstance(item, dict):
             continue
         t = item.get("type")
+        if t is None and ("role" in item or "content" in item):
+            # EasyInput 简写：{"role","content"} 不带 type（OpenAI SDK 与
+            # deepseek-harness 等直发此形状），按 message 处理
+            t = "message"
         if t == "message":
             flush_calls()
             role = item.get("role") or "user"
