@@ -32,6 +32,8 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, g, jsonify, request
 
+import anthropic_bridge
+
 load_dotenv()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -456,7 +458,9 @@ def _auth_and_rid():
     g.rid = "r%04d" % int(time.time() * 10 % 10000)
     g.t0 = time.time()
     if API_KEY and request.path != "/health":
-        if request.headers.get("Authorization") != "Bearer " + API_KEY:
+        # Anthropic 客户端（Claude Code 等）发 x-api-key 而非 Authorization: Bearer
+        if (request.headers.get("Authorization") != "Bearer " + API_KEY
+                and request.headers.get("x-api-key") != API_KEY):
             return jsonify(error="unauthorized"), 401
     ua = (request.headers.get("User-Agent") or "-").replace("\r", " ").replace("\n", " ")
     try:
@@ -469,7 +473,7 @@ def _auth_and_rid():
                 payload.get("model"), len(payload.get("messages") or []),
                 len(payload.get("tools") or []), payload.get("stream"), ua,
                 request.content_length or 0)
-    if request.path == "/v1/chat/completions":
+    if request.path in ("/v1/chat/completions", "/v1/messages"):
         _dump_save(g.rid, "req", request.get_data(cache=True, as_text=True))
 
 
@@ -692,6 +696,92 @@ def responses_route():
                               "type": "upstream_error"}), 502
     body = json.dumps(done, ensure_ascii=False)
     logger.info("[%s] done: responses-aggr %dB %.1fs", g.rid, len(body), time.time() - g.t0)
+    return Response(body, status=200, content_type="application/json")
+
+
+# ── /v1/messages：Anthropic Messages 协议 -> 本地翻成 Chat 走上游 ──────────────
+# 上游 /inference/v1/messages 是付费凭证面（免费模型 403、付费 401），免费层
+# 走不了直通；这里用 anthropic_bridge 在本地把 Anthropic ⇄ Chat 翻掉，上游照旧
+# 走 chat 线（同一套免费层指纹 + 闸门工具）。鉴权同 chat，另接受 x-api-key。
+
+
+@app.route("/v1/messages", methods=["POST"])
+def messages_route():
+    p = g.payload
+    model = p.get("model") or ""
+    if model and not _model_free(model):
+        return jsonify(anthropic_bridge.error_body(
+            "invalid_request_error",
+            "model %s 不在免费清单（the unit2api 只转发 free 模型）" % model)), 400
+
+    try:
+        chat_payload = anthropic_bridge.anthropic_to_chat(p)
+    except Exception as e:
+        return jsonify(anthropic_bridge.error_body(
+            "invalid_request_error", "请求翻译失败: %s" % e)), 400
+    chat_payload["model"] = model
+    chat_payload["stream"] = True            # 上游只收流式
+    chat_payload["stream_options"] = {"include_usage": True}
+    # 闸门工具：与 chat 线同一做法（客户端工具在前，缺失的小写 stub 补后）
+    tools = chat_payload.get("tools")
+    if not isinstance(tools, list) or not tools:
+        chat_payload["tools"] = GATE_TOOLS
+    else:
+        names = {(t.get("function") or {}).get("name")
+                 for t in tools if isinstance(t, dict)}
+        chat_payload["tools"] = list(tools) + [
+            t for t in GATE_TOOLS if t["function"]["name"] not in names]
+    want_stream = bool(p.get("stream"))
+
+    try:
+        upstream = _post_upstream("/chat/completions", chat_payload,
+                                  _session_seed(chat_payload), g.rid)
+    except requests.RequestException as e:
+        logger.error("[%s] messages 上游连接失败: %s: %s", g.rid, type(e).__name__, e)
+        return jsonify(anthropic_bridge.error_body("api_error", str(e))), 502
+
+    if upstream.status_code >= 400:
+        body = upstream.text[:400]
+        logger.warning("[%s] messages 上游错误 HTTP %s: %s", g.rid,
+                       upstream.status_code, body)
+        _dump_save(g.rid, "resp", upstream.text)
+        err = anthropic_bridge.error_body(
+            anthropic_bridge.err_type_for_http(upstream.status_code), body)
+        return Response(json.dumps(err, ensure_ascii=False),
+                        status=upstream.status_code,
+                        content_type="application/json")
+
+    if want_stream:
+        rid, t0 = g.rid, g.t0
+
+        def gen():
+            n = 0
+            ttft = None
+            try:
+                for frame in anthropic_bridge.chat_sse_to_anthropic(
+                        upstream.iter_lines(decode_unicode=False), model):
+                    if ttft is None:
+                        ttft = time.time() - t0
+                    n += len(frame)
+                    yield frame
+            finally:
+                logger.info("[%s] done: messages %dB %.1fs ttft=%s", rid, n,
+                            time.time() - t0,
+                            "%.1fs" % ttft if ttft else "-")
+        return Response(gen(), status=200, content_type="text/event-stream")
+
+    # 非流式：聚合 Chat SSE -> Chat JSON -> Anthropic Message
+    chat_json = anthropic_bridge.aggregate_chat_sse(
+        upstream.iter_lines(decode_unicode=False), model)
+    uerr = chat_json.pop("_upstream_error", None)
+    if uerr is not None:
+        err = anthropic_bridge.error_body("api_error", uerr[1])
+        return Response(json.dumps(err, ensure_ascii=False),
+                        status=502, content_type="application/json")
+    result = anthropic_bridge.chat_json_to_anthropic(chat_json, model)
+    body = json.dumps(result, ensure_ascii=False)
+    logger.info("[%s] done: messages-aggr %dB %.1fs", g.rid, len(body),
+                time.time() - g.t0)
     return Response(body, status=200, content_type="application/json")
 
 
