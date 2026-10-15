@@ -2,16 +2,6 @@
 
 OpenCode 逆向调研成果，以及 zen 网关的纯直连免费层代理（`OpenCode2api`，端口 **8390**）。
 
-## 目录
-
-| 目录 | 内容 |
-| --- | --- |
-| [`OpenCode2api/`](OpenCode2api/) | 主产物：zen 网关免费层 OpenAI 兼容代理（详见其 README） |
-| `opencode2api-repo/` | 社区参考实现（6Kmfi6HP/opencode2api，Go），用于校准三头同值、UA 与 `x-opencode-*` 系列头 |
-| `repo-v2/` | anomalyco/opencode v2（TypeScript），用于校准客户端侧请求形状与工具集 |
-
-两个克隆均已 gitignore。
-
 ## opencode2api 速览
 
 ```bash
