@@ -1,73 +1,91 @@
-# OpenCode2api 使用说明
+# OpenCode2api
 
-> 建成的反代：`E:\VSCodeSpace\Agent\OpenCode\OpenCode2api\`（端口 **8390**）
-> 上游：OpenCode 免费层网关 `https://OpenCode.ai/inference/v1`（`/zen/v1` 已作废，匿名请求一律 403）
-> 建成时间：2026-10-11
+> OpenCode 免费模型 → OpenAI / Anthropic 兼容 API 网关
 
-## 1. 它是什么
+把 OpenCode 免费层（`/inference/v1`）暴露为三协议兼容接口，供任意客户端调用。只转发 free 模型，付费面一律拒绝。
 
-把 OpenCode 的 **free 模型**暴露成标准 OpenAI 兼容接口，供任意客户端（OpenCode / Cline / 其他 OpenAI 客户端）调用。
-只转发 free 模型，付费面一律拒绝（防误扣费）。
+## 功能特性
 
-## 2. 启动方式
+- **三协议兼容**：OpenAI Chat Completions · OpenAI Responses · Anthropic Messages
+- **免费模型透传**：自动拉取活清单，筛 free 模型（id 以 `-free` 结尾或 `big-pickle`），每 10 分钟刷新
+- **匿名接入**：免费层为匿名面，上游固定 `Bearer public`，无需任何凭证
+- **流式 / 非流式双模式**
+
+## 快速开始
 
 ```bash
-cd E:\VSCodeSpace\Agent\OpenCode\OpenCode2api
+pip install -r requirements.txt
 python server.py
 ```
 
-启动后会：
-1. 拉 **活清单** `GET /inference/v1/models` → 筛 free（id 以 `-free` 结尾，或 `big-pickle`），剔除已废弃的 `exo-free`（⚠ 基址只认 `/inference/v1`：`.env` 的 `ZEN_BASE` 若还写 `/zen/v1`，清单与推理会全档 401/403，2026-10-15 就这样挂过一轮）；
-2. 每 10 分钟自动刷新（free 模型会上下线，静态清单不可信）；
-3. 监听 `127.0.0.1:8390`。
-
-## 3. 客户端配置
-
 ```
-Base URL: http://127.0.0.1:8390/v1
-API Key : 见 .env 的 API_KEY
-模型    : /v1/models 返回的 id（如 nemotron-3.5-lightning-free、big-pickle、mimo-v2.6-flash-free）
+Base URL : http://127.0.0.1:8390/v1
+API Key  : .env 的 API_KEY
+Model    : /v1/models 返回的 id（nemotron-3.5-lightning-free、big-pickle、mimo-v2.6-flash-free …）
 ```
 
-接口：`GET /health`、`GET /v1/models`、`POST /v1/chat/completions`（流式/非流式都支持）。
+## API 接口
 
-## 4. 免费层指纹（改代码必看，2026-10-15 更新到 V2 门禁）
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI Chat Completions（流式/非流式） |
+| `/v1/responses` | POST | OpenAI Responses API（翻译层 ⇄ Chat） |
+| `/v1/messages` | POST | Anthropic Messages API（翻译层 ⇄ Chat） |
+| `/v1/models` | GET | 可用模型列表（仅 free 模型） |
+| `/health` | GET | 存活探针 |
 
-架构：**纯直连** 免费层网关（参考 6Kmfi6HP/opencode2api），基址固定 `/inference/v1`。
+### 协议翻译架构
+
+```
+客户端                 proxy 翻译层              上游（仅 Chat）
+─────────            ─────────────            ─────────────
+Chat Completions ──→  直通                 ──→  /inference/v1/chat/completions
+Responses        ──→  responses_to_chat   ──→  /inference/v1/chat/completions
+Anthropic        ──→  anthropic_to_chat   ──→  /inference/v1/chat/completions
+                    ↑ 响应翻回各自格式
+```
+
+Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向翻译层。`thinking`、`cache_control` 等 Anthropic 特有字段无 Chat 对应项，翻译时丢弃。
+
+## 配置
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `API_KEY` | — | 本地鉴权 Bearer token |
+| `PORT` | `8390` | 监听端口 |
+| `ZEN_BASE` | `…/inference/v1` | 上游基址（⚠ `/zen/v1` 已作废，残留旧值导致 401/403） |
+| `UPSTREAM_AUTH` | `Bearer public` | 上游鉴权（免费层匿名，带 sk- key 反而 401） |
+
+## 免费层指纹
+
 上游对 free 模型有身份闸门，以下要件缺一即 `403 FreeTierError`：
 
-| # | 要件 | 本服务实现 |
-|---|---|---|
-| 1 | `User-Agent` = `opencode/latest/2.0.29/cli`（三段式，ver ≥ 2.0.0） | `OC_UA` 常量 |
-| 2 | **会话四头同值**：`x-opencode-session` + `x-session-id` + `x-session-affinity` + `x-opencode-session-id`，均须 `ses_`+12hex+14base62，且前 12 hex 为**降序时间戳** `~(ts_ms*0x1000+counter)` 低 48 位（纯随机/升序即 403） | `_stable_session(seed)`：种子→会话映射 + 落盘 + 3 天 TTL，同对话恒定 |
-| 3 | `x-opencode-client: cli`、`x-opencode-project: global`（40-hex project id 即 403）；`x-opencode-request` **不得出现**（存在本身即 403） | `_upstream_headers()` |
-| 4 | body 声明**四件工具** `bash/glob/grep/read`，OpenAI 线格式（`function.name`+`parameters`） | `GATE_TOOLS` |
-| 5 | `stream: true` + `stream_options.include_usage: true`；`Accept: application/json` | chat() 构造 |
-| 6 | `Authorization: Bearer public`（免费层是**匿名面**；带 sk- key 反被判 401 `Invalid credential`） | `UPSTREAM_AUTH`（2026-10-15 实测 public 4/4 200、key 4/4 401） |
+| 要件 | 实现 |
+|---|---|
+| `User-Agent: opencode/latest/2.0.29/cli` | `OC_UA` 常量 |
+| 会话四头同值，降序时间戳格式 `ses_`+12hex+14base62 | `_stable_session()` 种子→会话映射 + 落盘 + 3 天 TTL |
+| `x-opencode-client: cli`、`x-opencode-project: global` | `_upstream_headers()` |
+| body 声明四件工具 `bash/glob/grep/read` | `GATE_TOOLS` |
+| `stream: true` + `stream_options.include_usage: true` | `chat()` 构造 |
+| `Authorization: Bearer public` | `UPSTREAM_AUTH` |
 
-### 踩坑实录（都曾导致 403，逐个排掉）
+## 已知限制
 
-- **头名字面量被污染**（`"x-OpenCode-session"`、`"User-helper"`，带空格的非法头名）：server 与
-  独立探针行为不一致的元凶——探针字面量正确能 200，server 发的全是非法头名。改代码后必须
-  字节级 grep 校验，不信显示层。
-- **会话 ID 形态不合规**：尾段必须 14 位（总 26 位），少了直接 403；`_stable_session` 切片
-  曾取 `d[6:16]`（只有 10 位）。
-- **逐请求随机会话 ID**：同一 IP 短时间几百个"全新会话"是典型滥用特征，会触发风控把判定
-  收紧成 403。必须稳定派生。
-- **非流式聚合编码**：上游 SSE 不带 charset，`iter_lines(decode_unicode=True)` 按 Latin-1
-  猜编码，中文全毁；必须字节级收 + 显式 UTF-8 解码。
+- **配额**：free 面有 per-IP 限流，密集测试触发 `429`/`403`，冷却后自恢复
+- **模型会变**：以活清单为准；`exo-free` 已废弃（410）
+- **muse-spark-\* 走 Responses**：推理模型，`max_output_tokens` 给太小触发 `incomplete` 截断
+- **thinking / cache_control 丢失**：Anthropic 特有字段，Chat 协议无对应项
+- **绝不读 OpenCode 本体凭证**（`~/.local/share/OpenCode/auth.json`）；dumps 只落 body 不落 header
 
-## 5. 已知限制 / 踩坑记录
+## 项目结构
 
-- **配额**：free 面有 per-IP/per-key 限流。密集测试会打出 `429 FreeUsageLimitError` 或 `403 FreeTierError`，**冷却后自恢复**（建成当日因压测数百次被限流，非代码缺陷）。
-- **模型会变**：以活清单为准；`exo-free` 已废弃（410）并在代码中剔除。
-- **`muse-spark-*` 走 `/responses`**：本服务已加 `/v1/responses` 透传路由（同指纹；上游强制 `stream:true`，非流式本地聚合 completed/incomplete/failed 终态帧），已配入 AtomCode（`provider="responses"` 账号）。注意 muse-spark 是推理模型，`max_output_tokens` 给太小会被推理耗尽触发 `incomplete` 截断。
-- 凭证：免费层是**匿名面**，上游请求固定 `Authorization: Bearer public`，不需要任何 key（带上真实 key 反而被判 401 `Invalid credential`，2026-10-15 实测）；**绝不读 OpenCode 本体的 `~/.local/share/OpenCode/auth.json`**；dumps 只落 body，不落 header。
-- 社区参考实现已克隆至上级 `opencode2api-repo/`（6Kmfi6HP/opencode2api，Go，活跃维护）。
-
-## 6. 相关文件
-
-- `server.py` —— 反代主体
-- `.env` —— `API_KEY`（本地鉴权）、`PORT`、`ZEN_BASE`（上游）
-- `key materials.json` —— 上游 key；**已不参与请求**（免费层匿名，要改用真 key 设环境变量 `UPSTREAM_AUTH`）
-- `request.log` / `dumps/` —— 日志与请求响应原文（仅 body）
+```
+OpenCode2api/
+├── server.py              # Flask 反代主体
+├── responses_bridge.py    # Responses ⇄ Chat 翻译层
+├── anthropic_bridge.py    # Anthropic ⇄ Chat 翻译层
+├── test_anthropic_route.py
+├── .env                   # 本地配置
+├── request.log            # 运行日志
+└── dumps/                 # 请求/响应原文（仅 body）
+```
