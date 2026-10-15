@@ -13,6 +13,9 @@ dumps/
 
 # 本地运行态（免费清单落盘，随上游变，不必进版本库）
 free_cache.json
+# 会话种子→session 映射与探针抓包产物（运行时生成，不入库）
+session_cache.json
+dump_upstream_*.json
 
 # Python 产物
 __pycache__/
