@@ -39,6 +39,8 @@ Model    : /v1/models 返回的 id（当前免费清单见下方「免费模型�
 | `longcat-2.5-preview-free` | |
 | `deepseek-v4.1-flash-free` | |
 | `space-bunny-free` | |
+| `glm-5.3-flash-free` | 推理模型，先吐 `reasoning_content`；`max_tokens` 给小会 `finish_reason=length` 且正文为空 |
+| `ll-alpha-free` | |
 
 ## API 接口
 
