@@ -21,15 +21,31 @@ python server.py
 ```
 Base URL : http://127.0.0.1:8390/v1
 API Key  : .env 的 API_KEY
-Model    : /v1/models 返回的 id（nemotron-3.5-lightning-free、big-pickle、mimo-v2.6-flash-free …）
+Model    : /v1/models 返回的 id（当前免费清单见下方「免费模型清单」）
 ```
+
+## 免费模型清单
+
+| 模型 id | 备注（本地约定） |
+| --- | --- |
+| `big-pickle` | 免费面特例：id 不以 `-free` 结尾 |
+| `cat-jam-free` | |
+| `mimo-v2.6-flash-free` | |
+| `muse-spark-1.2-contributor-free` | 推理模型，走 `/v1/responses` 原生透传；`max_output_tokens` 给小会 `incomplete` 截断 |
+| `muse-spark-1.3-contributor-free` | 同上 |
+| `nemotron-3.5-super-vl-free` | |
+| `nemotron-3.5-lightning-free` | |
+| `jev-1.13-free` | |
+| `longcat-2.5-preview-free` | |
+| `deepseek-v4.1-flash-free` | |
+| `space-bunny-free` | |
 
 ## API 接口
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/v1/chat/completions` | POST | OpenAI Chat Completions（流式/非流式） |
-| `/v1/responses` | POST | OpenAI Responses API（翻译层 ⇄ Chat） |
+| `/v1/responses` | POST | OpenAI Responses API（**原生透传**，muse-spark-\* 等 Responses 原生模型直连上游） |
 | `/v1/messages` | POST | Anthropic Messages API（翻译层 ⇄ Chat） |
 | `/v1/models` | GET | 可用模型列表（仅 free 模型） |
 | `/health` | GET | 存活探针 |
@@ -37,15 +53,16 @@ Model    : /v1/models 返回的 id（nemotron-3.5-lightning-free、big-pickle、
 ### 协议翻译架构
 
 ```
-客户端                 proxy 翻译层              上游（仅 Chat）
-─────────            ─────────────            ─────────────
-Chat Completions ──→  直通                 ──→  /inference/v1/chat/completions
-Responses        ──→  responses_to_chat   ──→  /inference/v1/chat/completions
-Anthropic        ──→  anthropic_to_chat   ──→  /inference/v1/chat/completions
-                    ↑ 响应翻回各自格式
+客户端                proxy 处理                      上游（/inference/v1）
+─────────            ─────────────                  ─────────────
+Chat Completions ──→  直通                       ──→  /chat/completions
+Responses        ──→  原生透传（仅补闸门要件：     ──→  /responses
+                      stream:true、gate 四工具、
+                      会话头；模型字段原样）
+Anthropic        ──→  anthropic_bridge（双向翻译）──→  /chat/completions
 ```
 
-Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向翻译层。`thinking`、`cache_control` 等 Anthropic 特有字段无 Chat 对应项，翻译时丢弃。
+OpenCode 免费层的 muse-spark-\* 系上游原生说 Responses 协议，`/v1/responses` 不走翻译、字节级透传（与 Chat 通道分路）；`cache_control` 与 Anthropic 入站 `thinking` 配置在翻译层丢弃，Responses 透传路径协议字段原样直达上游。
 
 ## 配置
 
@@ -72,8 +89,8 @@ Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向
 ## 已知限制
 
 - **配额**：free 面有 per-IP 限流，密集测试触发 `429`/`403`，冷却后自恢复
-- **模型会变**：以活清单为准；`exo-free` 已废弃（410）
-- **muse-spark-\* 走 Responses**：推理模型，`max_output_tokens` 给太小触发 `incomplete` 截断
-- **thinking / cache_control 丢失**：Anthropic 特有字段，Chat 协议无对应项
+- **模型会变**：以活清单为准，见上方「免费模型清单」；`exo-free` 已废弃（410）
+- **muse-spark-\* 走 Responses**：推理模型，原生 Responses 透传；`max_output_tokens` 给太小触发 `incomplete` 截断
+- **cache_control / Anthropic thinking 配置丢弃**：Anthropic 翻译层丢弃（Chat 侧本就无对应项）；Responses 透传路径不受影响
 - **绝不读 OpenCode 本体凭证**（`~/.local/share/OpenCode/auth.json`）；dumps 只落 body 不落 header
 
