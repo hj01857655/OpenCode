@@ -21,6 +21,7 @@ serde 必填字段为准核对过，不是猜的：
 """
 
 import json
+import re
 import time
 import uuid
 
@@ -496,6 +497,9 @@ def chat_sse_to_responses(stream, model):
                 yield frame({"type": "response.output_text.done",
                              "item_id": item["id"], "output_index": idx,
                              "content_index": 0, "text": t["buf"]})
+                # 终帧必须携带全文：把攒的 buffer 写回 item，
+                # 否则 output_item.done / response.completed 里正文为空
+                item["content"][0]["text"] = t["buf"]
             item["status"] = "completed"
         elif item["type"] == "function_call":
             stl = next((s for s in st.tools.values()
@@ -640,5 +644,111 @@ def response_json_to_sse(response_obj):
     terminal = {"completed": "response.completed",
                 "failed": "response.failed",
                 "incomplete": "response.incomplete"}.get(
-            status, "response.completed")
+                status, "response.completed")
     yield frame({"type": terminal, "response": response_obj})
+
+
+# ============================================================
+# 六、antml 文本工具调用回收（Qwen 系不稳定工具调用形态）
+# ============================================================
+#
+# Qwen 系模型在部分系统提示下会把工具调用写成 antml 纯文本而不是结构化
+# tool_calls：
+#     <invoke name="Bash">
+#     <parameter name="command">…
+#     <parameter name="timeout">600000
+#     </invoke>
+# 客户端（claude-cli / grok / deepseek-harness）只认结构化 tool_calls，文本透传
+# 会直接卡死回合（finish=stop、无工具调用）。InvokeSalvage 把文本拆回
+# tool_call 事件，由调用方（各 server.py）转成各自路由的协议帧。
+# 回收器无副作用：解析失败一律降级为纯文本透传，绝不丢内容。
+
+_INVOKE_START = '<invoke name="'
+_INVOKE_END = '</invoke>'
+_PARAM_RE = re.compile(r'<(\w+) name="([^"]*)">(.*?)</\1>', re.S)
+
+
+def _coerce_param(v):
+    """XML 参数值是裸文本：数字/布尔还原成 JSON 类型（如 timeout 600000），其余保持字符串。"""
+    try:
+        x = json.loads(v)
+        if isinstance(x, (int, float, bool)):
+            return x
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return v
+
+
+class InvokeSalvage:
+    """正文文本工具调用的流式回收器（有界前瞻）。
+
+    feed(text) -> [(kind, payload), ...]
+        ("text", str)        —— 透传正文
+        ("tool_call", dict)  —— {"name": …, "params": {k: v}}
+    flush() -> 同形状，流末清空残留缓冲（未闭合块退回纯文本）。
+
+    只扣住"可能是 invoke 起始标记"的缓冲尾部（≤14 字符），其余正文实时放行；
+    解析失败一律降级为纯文本透传，绝不丢内容。
+    """
+
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, text):
+        if not text:
+            return []
+        out = []
+        self.buf += text
+        while True:
+            start = self.buf.find(_INVOKE_START)
+            if start == -1:
+                hold = self._partial_tail()
+                cut = len(self.buf) - hold
+                head, self.buf = self.buf[:cut], self.buf[cut:]
+                if head:
+                    out.append(("text", head))
+                return out
+            end = self.buf.find(_INVOKE_END, start)
+            if end == -1:
+                # 块未闭合：放行标记前文本，从标记起扣住
+                if start:
+                    out.append(("text", self.buf[:start]))
+                self.buf = self.buf[start:]
+                return out
+            # 完整块：前段放行、解析块、继续扫剩余
+            if start:
+                out.append(("text", self.buf[:start]))
+            block = self.buf[start:end + len(_INVOKE_END)]
+            tc = self._parse(block)
+            if tc is None:
+                out.append(("text", block))  # 解析失败：整块降级纯文本
+            else:
+                out.append(("tool_call", tc))
+            self.buf = self.buf[end + len(_INVOKE_END):]
+
+    def flush(self):
+        if self.buf:
+            out, self.buf = [("text", self.buf)], ""
+            return out
+        return []
+
+    def _partial_tail(self):
+        """缓冲尾部是起始标记部分前缀的字符数（0 = 无）。"""
+        m = min(len(self.buf), len(_INVOKE_START))
+        for n in range(m, 0, -1):
+            if self.buf[-n:] == _INVOKE_START[:n]:
+                return n
+        return 0
+
+    @staticmethod
+    def _parse(block):
+        m = re.match(r'<invoke name="([^"]+)">\s*', block)
+        if not m:
+            return None
+        inner = block[m.end():-len(_INVOKE_END)]
+        params = {}
+        for pm in _PARAM_RE.finditer(inner):
+            if pm.group(1) != "parameter":
+                continue
+            params[pm.group(2)] = _coerce_param(pm.group(3))
+        return {"name": m.group(1), "params": params}
